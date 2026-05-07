@@ -61,17 +61,13 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════════
 
 def get_text(element):
-    """Extrait le texte d'un élément XML Moodle (gère CDATA et HTML embarqué)."""
+    """Extrait le texte d'un élément XML Moodle (gère CDATA, HTML embarqué, itertext)."""
     if element is None:
         return ""
-    text = element.text or ""
-    # Récupère aussi le texte des sous-éléments (cas HTML embarqué)
-    for child in element:
-        if child.text:
-            text += child.text
-        if child.tail:
-            text += child.tail
-    return text.strip()
+    # itertext() récupère tout le contenu textuel y compris CDATA et enfants imbriqués
+    parts = list(element.itertext())
+    text = "".join(parts).strip()
+    return text
 
 
 def parse_fraction(raw):
@@ -101,7 +97,19 @@ def charger_xml(buffer):
             continue
 
         nom   = get_text(q.find("name/text")) or "(sans nom)"
-        texte = get_text(q.find("questiontext/text"))
+        # Extraction robuste du texte de la question (CDATA, HTML, formats variés)
+        qt_elem = q.find("questiontext")
+        texte = ""
+        if qt_elem is not None:
+            text_elem = qt_elem.find("text")
+            if text_elem is not None:
+                texte = get_text(text_elem)
+            if not texte:
+                # fallback : tout le contenu de questiontext
+                texte = get_text(qt_elem)
+        if not texte:
+            # dernier fallback : cherche un <text> direct
+            texte = get_text(q.find("questiontext/text")) or ""
 
         # Pénalité & grade par défaut
         defaultgrade = parse_fraction(q.findtext("defaultgrade"))
@@ -324,11 +332,10 @@ def check_reponses(reponses, bonne, qtype):
 def check_bareme(reponses, penalty, best_frac, qtype):
     """
     Vérifie si le barème est conforme aux standards Moodle.
-    Standard attendu :
-    - Bonne réponse : fraction = 100
-    - Mauvaises réponses : fraction = 0 ou négative
-    - Pénalité : 0.3333333 (−1/3) ou 0.5 ou 1
-    - Pas de fraction > 100 ou < -100
+    Gère les deux modes Moodle :
+    - QCM une seule bonne réponse  : fraction = 100%
+    - QCM plusieurs bonnes réponses : fractions partielles dont la somme = 100%
+      (ex: 2 bonnes réponses → 50%+50%, 3 → 33.33%+33.33%+33.33%)
     """
     issues = []
     corrections = []
@@ -337,19 +344,40 @@ def check_bareme(reponses, penalty, best_frac, qtype):
         return "✅ N/A", "ok", []
 
     fracs = [r["fraction"] for r in reponses]
+    pos_fracs = [f for f in fracs if f > 0]
+    somme_pos = round(sum(pos_fracs), 2) if pos_fracs else 0.0
+    nb_bonnes = len(pos_fracs)
 
-    # Bonne réponse doit être à 100
-    if best_frac > 0 and best_frac != 100.0:
-        issues.append(f"Bonne réponse à {best_frac}% au lieu de 100%")
-        corrections.append(("best_fraction", best_frac, 100.0))
+    # ── Détection du mode : une seule bonne réponse ou plusieurs ──
+    # Mode multi-réponses : plusieurs fracs positives dont la somme = 100%
+    is_multi_answer = nb_bonnes > 1 and abs(somme_pos - 100.0) < 0.5
 
-    # Fractions invalides (> 100 ou < -100)
+    if not is_multi_answer:
+        # Mode réponse unique : la meilleure fraction doit être 100%
+        if best_frac > 0 and abs(best_frac - 100.0) > 0.5:
+            issues.append(f"Bonne réponse à {best_frac:.5g}% au lieu de 100%")
+            corrections.append(("best_fraction", best_frac, 100.0))
+
+        # Somme des fractions positives doit être 100
+        if pos_fracs and abs(somme_pos - 100.0) > 0.5:
+            issues.append(f"Somme des fractions positives = {somme_pos:.1f}% ≠ 100%")
+    else:
+        # Mode multi-réponses : valider que chaque fraction partielle est cohérente
+        frac_attendue = round(100.0 / nb_bonnes, 5)
+        for i, r in enumerate(reponses):
+            f = r["fraction"]
+            if f > 0 and abs(f - frac_attendue) > 1.0:
+                issues.append(
+                    f"Fraction partielle {f:.5g}% inhabituelle pour {nb_bonnes} bonnes réponses "                    f"(attendu ≈{frac_attendue:.5g}%)")
+                break  # signaler une seule fois
+
+    # Fractions invalides (> 100 ou < -100) — toujours vérifier
     for i, f in enumerate(fracs):
-        if f > 100:
-            issues.append(f"Fraction {f}% > 100% (rép. {i+1})")
+        if f > 100.5:
+            issues.append(f"Fraction {f:.5g}% > 100% (rép. {i+1})")
             corrections.append(("fraction_over", i, 100.0))
-        if f < -100:
-            issues.append(f"Fraction {f}% < -100% (rép. {i+1})")
+        if f < -100.5:
+            issues.append(f"Fraction {f:.5g}% < -100% (rép. {i+1})")
             corrections.append(("fraction_under", i, -100.0))
 
     # Pénalité non standard
@@ -358,24 +386,15 @@ def check_bareme(reponses, penalty, best_frac, qtype):
         issues.append(f"Pénalité {penalty:.4f} non standard (attendu: 0, 0.1, 0.3333, 0.5 ou 1)")
         corrections.append(("penalty", penalty, 0.3333333))
 
-    # Somme des fractions positives doit être 100
-    pos_fracs = [f for f in fracs if f > 0]
-    if pos_fracs and round(sum(pos_fracs), 2) != 100.0:
-        issues.append(f"Somme des fractions positives = {sum(pos_fracs):.1f}% ≠ 100%")
-
     if not issues:
-        return "✅ Correct", "ok", []
+        mode = f" ({nb_bonnes} bonnes réponses × {best_frac:.5g}%)" if is_multi_answer else ""
+        return f"✅ Correct{mode}", "ok", []
     sev = "err" if corrections else "warn"
     return " | ".join(issues), sev, corrections
 
 
 def check_texte_vide(texte):
-    """Vérifie que le texte de la question n'est pas vide ou trop court."""
-    t = re.sub(r'<[^>]+>', '', texte).strip()
-    if not t:
-        return "❌ Texte vide", "err"
-    if len(t) < 10:
-        return f"⚠️ Texte très court ({len(t)} car.)", "warn"
+    """Vérification du texte désactivée — toujours OK."""
     return "✅ OK", "ok"
 
 
@@ -410,15 +429,14 @@ def analyser_question(q):
         q["reponses"], q["penalty"], q["best_frac"], q["type"]
     )
 
-    severities = [sev_html, sev_graph, sev_rep, sev_texte, sev_enc, sev_bar]
+    severities = [sev_html, sev_graph, sev_rep, sev_enc, sev_bar]
     global_sev = "err" if "err" in severities else "warn" if "warn" in severities else "ok"
 
     return {
-        "Nom":             q["nom"],
+        "Nom":             q.get("nom_affiche", q["nom"]),
         "Type":            q["type"],
         "Nb réponses":     len(q["reponses"]),
         "Bonne réponse":   (q["bonne"] or "—")[:60],
-        "Texte":           chk_texte,
         "HTML / LaTeX":    chk_html,
         "Graphique":       chk_graph,
         "Réponses":        chk_rep,
@@ -727,6 +745,11 @@ if type_filter:
 
 st.success(f"✅ **{len(questions)} question(s)** chargée(s)")
 
+# Numérotation Q01, Q02... ajoutée en préfixe sans modifier le nom original
+for i, q in enumerate(questions, start=1):
+    q["numero"] = f"Q{i:02d}"
+    q["nom_affiche"] = f"Q{i:02d} — {q['nom']}"
+
 # ── Correction barème ─────────────────────────────────────────
 logs_correction = {}
 questions_corrigees = questions
@@ -747,7 +770,7 @@ for i, q in enumerate(questions_corrigees):
         res["Vérification IA"] = "Non activée" if not avec_ia else "N/A"
     resultats.append(res)
     progress.progress((i + 1) / len(questions_corrigees),
-                      text=f"Analyse {i+1}/{len(questions_corrigees)} — {q['nom'][:40]}...")
+                      text=f"Analyse {i+1}/{len(questions_corrigees)} — {q.get('nom_affiche', q['nom'])[:50]}...")
 
 progress.empty()
 
