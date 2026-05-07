@@ -789,8 +789,51 @@ def colorier(val):
     if v.startswith("🔧"):  return "background-color:#d1ecf1; color:#0c5460"
     return ""
 
-styled = df_affiche[cols_show].style.applymap(colorier)
+# Compatibilité pandas >= 2.1 : applymap renommé map
+try:
+    styled = df_affiche[cols_show].style.map(colorier)
+except AttributeError:
+    styled = df_affiche[cols_show].style.applymap(colorier)
+
 st.dataframe(styled, use_container_width=True, height=420)
+
+# ── Questions problématiques (détail) ────────────────────────
+df_pb = df[df["Statut global"] != "✅ OK"].copy()
+if not df_pb.empty:
+    st.subheader(f"🚨 Questions problématiques ({len(df_pb)})")
+    cols_detail = ["Nom", "Type", "Statut global", "HTML / LaTeX", "Graphique",
+                   "Réponses", "Encodage", "Barème", "Texte"]
+    cols_detail = [c for c in cols_detail if c in df_pb.columns]
+    df_err  = df_pb[df_pb["Statut global"] == "❌ Erreur"]
+    df_warn = df_pb[df_pb["Statut global"] == "⚠️ Avertissement"]
+
+    if not df_err.empty:
+        with st.expander(f"❌ Erreurs critiques — {len(df_err)} question(s)", expanded=True):
+            try:
+                st.dataframe(df_err[cols_detail].style.map(colorier), use_container_width=True)
+            except AttributeError:
+                st.dataframe(df_err[cols_detail].style.applymap(colorier), use_container_width=True)
+            for _, row in df_err.iterrows():
+                st.markdown(f"**🔴 {row['Nom']}** — *{row['Type']}*")
+                for col in ["HTML / LaTeX", "Graphique", "Réponses", "Encodage", "Barème", "Texte"]:
+                    if col in row and not str(row[col]).startswith("✅"):
+                        st.markdown(f"&nbsp;&nbsp;• **{col}** : {row[col]}")
+                st.divider()
+
+    if not df_warn.empty:
+        with st.expander(f"⚠️ Avertissements — {len(df_warn)} question(s)", expanded=False):
+            try:
+                st.dataframe(df_warn[cols_detail].style.map(colorier), use_container_width=True)
+            except AttributeError:
+                st.dataframe(df_warn[cols_detail].style.applymap(colorier), use_container_width=True)
+            for _, row in df_warn.iterrows():
+                st.markdown(f"**🟡 {row['Nom']}** — *{row['Type']}*")
+                for col in ["HTML / LaTeX", "Graphique", "Réponses", "Encodage", "Barème", "Texte"]:
+                    if col in row and not str(row[col]).startswith("✅"):
+                        st.markdown(f"&nbsp;&nbsp;• **{col}** : {row[col]}")
+                st.divider()
+else:
+    st.success("🎉 Aucune question problématique détectée !")
 
 # ── Log corrections barème ────────────────────────────────────
 if logs_correction:
