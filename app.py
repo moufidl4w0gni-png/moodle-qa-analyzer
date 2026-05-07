@@ -454,38 +454,51 @@ def analyser_question(q):
 
 def corriger_bareme_question(q, penalty_cible=0.3333333):
     """
-    Corrige automatiquement le barème d'une question :
-    - Bonne réponse → fraction = 100
-    - Mauvaises réponses → fraction = 0 (ou −33.3333 si pénalité activée dans les réponses)
-    - Pénalité → penalty_cible
-    - defaultgrade inchangé
-    Retourne la question corrigée et un log des changements.
+    Corrige automatiquement le barème d'une question.
+    Détecte les QCM multi-réponses (fractions partielles dont la somme ≈ 100%)
+    et ne les modifie pas — seules les fractions vraiment invalides sont corrigées.
     """
     q_corr = copy.deepcopy(q)
     log = []
 
-    # Trouver la meilleure fraction actuelle
     if not q_corr["reponses"]:
         return q_corr, log
 
     fracs = [r["fraction"] for r in q_corr["reponses"]]
-    max_frac = max(fracs)
+    pos_fracs = [f for f in fracs if f > 0]
+    somme_pos = round(sum(pos_fracs), 1) if pos_fracs else 0.0
+    nb_bonnes = len(pos_fracs)
+    max_frac = max(fracs) if fracs else 0
 
-    for r in q_corr["reponses"]:
-        old = r["fraction"]
-        if r["fraction"] == max_frac and max_frac > 0:
-            # C'est la bonne réponse
-            if r["fraction"] != 100.0:
+    # Détecter si c'est un QCM multi-réponses valide (somme ≈ 100% avec plusieurs bonnes)
+    is_multi_answer = nb_bonnes > 1 and abs(somme_pos - 100.0) < 1.0
+
+    if is_multi_answer:
+        # QCM multi-réponses : barème déjà correct, on ne touche pas aux fractions
+        # Juste corriger les fractions franchement invalides (> 100 ou < -100)
+        for r in q_corr["reponses"]:
+            old = r["fraction"]
+            if r["fraction"] > 100.5:
                 r["fraction"] = 100.0
-                log.append(f"Bonne réponse '{r['texte'][:30]}' : {old}% → 100%")
-        else:
-            # Mauvaise réponse : doit être 0 ou négatif selon la politique
-            if r["fraction"] > 0:
-                r["fraction"] = 0.0
-                log.append(f"Mauvaise réponse '{r['texte'][:30]}' : {old}% → 0%")
-            elif r["fraction"] < -100:
+                log.append(f"Fraction invalide '{r['texte'][:30]}' : {old}% → 100%")
+            elif r["fraction"] < -100.5:
                 r["fraction"] = -100.0
                 log.append(f"Fraction invalide '{r['texte'][:30]}' : {old}% → -100%")
+    else:
+        # QCM réponse unique : la meilleure fraction doit être 100%
+        for r in q_corr["reponses"]:
+            old = r["fraction"]
+            if r["fraction"] == max_frac and max_frac > 0:
+                if abs(r["fraction"] - 100.0) > 0.5:
+                    r["fraction"] = 100.0
+                    log.append(f"Bonne réponse '{r['texte'][:30]}' : {old:.5g}% → 100%")
+            else:
+                if r["fraction"] > 0.5:
+                    r["fraction"] = 0.0
+                    log.append(f"Mauvaise réponse '{r['texte'][:30]}' : {old:.5g}% → 0%")
+                elif r["fraction"] < -100.5:
+                    r["fraction"] = -100.0
+                    log.append(f"Fraction invalide '{r['texte'][:30]}' : {old:.5g}% → -100%")
 
     # Pénalité
     if round(q_corr["penalty"], 4) != round(penalty_cible, 4):
